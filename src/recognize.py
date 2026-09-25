@@ -62,6 +62,7 @@ class FaceDet:
     y2: int
     score: float
     kps: np.ndarray  # Shape: (5, 2), full-frame coordinates
+    blendshapes: Optional[Dict[str, float]] = None
 
 
 @dataclass
@@ -188,6 +189,173 @@ def _kps_span_ok(
 
 
 # ---------------------------------------------------------------------
+# Face analysis: nose pose + expressions
+# ---------------------------------------------------------------------
+
+
+def nose_pose_cm(
+    kps: np.ndarray,
+    frame_width: int,
+    frame_height: int,
+    ipd_m: float = 0.062,
+    hfov_deg: float = 60.0,
+) -> Tuple[str, str, float, float, float]:
+    """
+    Estimate nose-tip direction and distance from the frame centre.
+
+    Uses the inter-pupillary distance seen in pixels as a depth cue:
+        distance_m = (ipd_m * focal_px) / eye_dist_px
+
+    Returns:
+        (left_right, up_down, distance_cm, dx_norm, dy_norm)
+    """
+
+    k = kps.astype(np.float32)
+
+    left_eye, right_eye = k[0], k[1]
+    nose = k[2]
+
+    eye_dist_px = float(
+        max(
+            1e-3,
+            np.linalg.norm(right_eye - left_eye),
+        )
+    )
+
+    focal_px = (
+        frame_width / 2.0
+    ) / np.tan(np.deg2rad(hfov_deg / 2.0))
+
+    distance_cm = (
+        (ipd_m * focal_px) / eye_dist_px
+    ) * 100.0
+
+    dx = (nose[0] / max(1, frame_width)) - 0.5
+    dy = (nose[1] / max(1, frame_height)) - 0.5
+
+    lr = (
+        "center"
+        if abs(dx) < 0.08
+        else ("left" if dx < 0 else "right")
+    )
+    ud = (
+        "middle"
+        if abs(dy) < 0.08
+        else ("up" if dy < 0 else "down")
+    )
+
+    return lr, ud, float(distance_cm), float(dx), float(dy)
+
+
+def classify_expression(
+    blendshapes: Optional[Dict[str, float]],
+) -> List[str]:
+    """
+    Map MediaPipe blendshape scores to readable expressions.
+
+    Covers: smile, frown, sadness, blink, grimace.
+    """
+
+    if not blendshapes:
+        return ["no_data"]
+
+    def avg(*names: str) -> float:
+        values = [
+            blendshapes.get(name, 0.0)
+            for name in names
+        ]
+        return float(sum(values) / max(1, len(values)))
+
+    smile = avg("mouthSmileLeft", "mouthSmileRight")
+    frown = avg("mouthFrownLeft", "mouthFrownRight")
+    blink = avg("eyeBlinkLeft", "eyeBlinkRight")
+    brow_down = max(
+        blendshapes.get("browDownLeft", 0.0),
+        blendshapes.get("browDownRight", 0.0),
+    )
+    brow_up = max(
+        blendshapes.get("browInnerUp", 0.0),
+        blendshapes.get("browOuterUpLeft", 0.0),
+        blendshapes.get("browOuterUpRight", 0.0),
+    )
+    sneer = max(
+        blendshapes.get("sneer", 0.0),
+        avg("mouthPressLeft", "mouthPressRight"),
+    )
+    jaw_open = blendshapes.get("jawOpen", 0.0)
+
+    labels: List[str] = []
+
+    if blink > 0.55:
+        labels.append("blink")
+
+    if smile >= 0.45 and frown <= 0.30:
+        labels.append("smile")
+
+    elif frown >= 0.45:
+        # Sadness: furrowed/straight mouth + raised inner brows.
+        if brow_up > 0.35 or smile < 0.15:
+            labels.append("sad")
+        else:
+            labels.append("frown")
+
+    if sneer > 0.45:
+        labels.append("grimace")
+
+    if jaw_open > 0.45:
+        labels.append("mouth_open")
+
+    if not labels:
+        labels.append("neutral")
+
+    return labels
+
+
+def _track_locked_face(
+    faces: List[FaceDet],
+    ref: Optional[FaceDet],
+) -> Optional[FaceDet]:
+    """
+    Pick which face keeps the lock.
+
+    With no reference, the largest face is chosen. Otherwise the
+    detected face whose centre is nearest to the previous locked
+    face's centre (within a gate scaled to face size) keeps the lock.
+    """
+
+    if not faces:
+        return None
+
+    if ref is None:
+        return max(
+            faces,
+            key=lambda f: (f.x2 - f.x1) * (f.y2 - f.y1),
+        )
+
+    cx = (ref.x1 + ref.x2) / 2.0
+    cy = (ref.y1 + ref.y2) / 2.0
+    lsize = max(
+        ref.x2 - ref.x1,
+        ref.y2 - ref.y1,
+    )
+    gate = max(50.0, lsize * 1.8)
+
+    best: Optional[FaceDet] = None
+    best_d = None
+
+    for f in faces:
+        fx = (f.x1 + f.x2) / 2.0
+        fy = (f.y1 + f.y2) / 2.0
+        d = float(np.hypot(fx - cx, fy - cy))
+
+        if d <= gate and (best_d is None or d < best_d):
+            best = f
+            best_d = d
+
+    return best
+
+
+# ---------------------------------------------------------------------
 # Database
 # ---------------------------------------------------------------------
 
@@ -289,7 +457,7 @@ class HaarFaceLandmarker5pt:
             min_face_detection_confidence=0.5,
             min_face_presence_confidence=0.5,
             min_tracking_confidence=0.5,
-            output_face_blendshapes=False,
+            output_face_blendshapes=True,
             output_facial_transformation_matrixes=False,
         )
 
@@ -325,20 +493,39 @@ class HaarFaceLandmarker5pt:
     # MediaPipe 5-point landmarks
     # -----------------------------------------------------------------
 
+    @staticmethod
+    def _blendshapes_dict(
+        result,  # mp.tasks.vision.FaceLandmarkerResult
+    ) -> Optional[Dict[str, float]]:
+        """Convert MediaPipe blendshape categories to a name->score dict.
+
+        `result.face_blendshapes` is ``List[List[Category]]``.
+        """
+
+        if not result.face_blendshapes:
+            return None
+
+        categories = result.face_blendshapes[0]
+
+        return {
+            category.category_name: float(category.score)
+            for category in categories
+        }
+
     def _roi_landmarks_5pt(
         self,
         roi_bgr: np.ndarray,
-    ) -> Optional[np.ndarray]:
+    ) -> Optional[Tuple[np.ndarray, Optional[Dict[str, float]]]]:
         """
         Run MediaPipe FaceLandmarker on one ROI.
 
-        Returns five points in ROI coordinates.
+        Returns five points in ROI coordinates and the blendshape scores.
         """
 
         height, width = roi_bgr.shape[:2]
 
         if height < 20 or width < 20:
-            return None
+            return None, None
 
         roi_rgb = cv2.cvtColor(
             roi_bgr,
@@ -359,7 +546,7 @@ class HaarFaceLandmarker5pt:
         )
 
         if not result.face_landmarks:
-            return None
+            return None, None
 
         landmarks = result.face_landmarks[0]
 
@@ -395,7 +582,7 @@ class HaarFaceLandmarker5pt:
         if kps[3, 0] > kps[4, 0]:
             kps[[3, 4]] = kps[[4, 3]]
 
-        return kps
+        return kps, self._blendshapes_dict(result)
 
     # -----------------------------------------------------------------
     # Public detection
@@ -447,7 +634,9 @@ class HaarFaceLandmarker5pt:
                 rx1:rx2,
             ]
 
-            kps_roi = self._roi_landmarks_5pt(roi)
+            kps_roi, blendshapes = self._roi_landmarks_5pt(
+                roi
+            )
 
             if kps_roi is None:
                 if self.debug:
@@ -503,6 +692,7 @@ class HaarFaceLandmarker5pt:
                     y2=y2,
                     score=1.0,
                     kps=kps.astype(np.float32),
+                    blendshapes=blendshapes,
                 )
             )
 
@@ -669,13 +859,20 @@ def main() -> None:
         )
         print(
             "q=quit | r=reload DB | "
-            "+/-=threshold | d=debug"
+            "+/-=threshold | l=lock | "
+            "d=debug"
         )
 
         t0 = time.time()
         frames = 0
         fps: Optional[float] = None
         show_debug = False
+        last_face_seen = time.time()
+
+        lock_on = False
+        locked_face: Optional[FaceDet] = None
+        locked_name: Optional[str] = None
+        lock_lost_at: Optional[float] = None
 
         while True:
             ok, frame = cap.read()
@@ -693,6 +890,38 @@ def main() -> None:
             )
 
             vis = frame.copy()
+
+            # ---------------------------------------------------------
+            # Face lock: pin recognition to one person.
+            # ---------------------------------------------------------
+
+            targets = list(faces)
+
+            if lock_on:
+                if locked_face is None:
+                    locked_face = _track_locked_face(
+                        faces,
+                        None,
+                    )
+
+                    targets = (
+                        [locked_face]
+                        if locked_face is not None
+                        else []
+                    )
+
+                else:
+                    tracked = _track_locked_face(
+                        faces,
+                        locked_face,
+                    )
+
+                    if tracked is not None:
+                        locked_face = tracked
+                        lock_lost_at = None
+                        targets = [locked_face]
+                    else:
+                        targets = []
 
             # ---------------------------------------------------------
             # FPS
@@ -722,10 +951,10 @@ def main() -> None:
             shown = 0
 
             # ---------------------------------------------------------
-            # Recognize every detected face
+            # Recognize every target face
             # ---------------------------------------------------------
 
-            for i, face in enumerate(faces):
+            for i, face in enumerate(targets):
                 # Draw bounding box.
                 cv2.rectangle(
                     vis,
@@ -771,14 +1000,42 @@ def main() -> None:
                     embedding_result.embedding
                 )
 
+                if lock_on and match.name is not None:
+                    locked_name = match.name
+
                 label = (
                     match.name
                     if match.name is not None
                     else "Unknown"
                 )
 
+                if lock_on and locked_name:
+                    label = locked_name
+
+                # -------------------------------------------------
+                # Expression + nose-pose overlay
+                # -------------------------------------------------
+
+                exprs = classify_expression(
+                    face.blendshapes
+                )
+
+                lr, ud, dist_cm, dx, dy = nose_pose_cm(
+                    face.kps,
+                    width,
+                    height,
+                )
+
                 line1 = label
                 line2 = (
+                    f"{', '.join(exprs)}"
+                )
+                line3 = (
+                    f"nose={lr}/{ud} "
+                    f"{dist_cm:.0f}cm "
+                    f"(dx={dx:+.2f} dy={dy:+.2f})"
+                )
+                line4 = (
                     f"dist={match.distance:.3f} "
                     f"sim={match.similarity:.3f}"
                 )
@@ -799,7 +1056,7 @@ def main() -> None:
                     line1,
                     (
                         face.x1,
-                        max(0, face.y1 - 28),
+                        max(0, face.y1 - 64),
                     ),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.8,
@@ -812,12 +1069,41 @@ def main() -> None:
                     line2,
                     (
                         face.x1,
-                        max(0, face.y1 - 6),
+                        max(0, face.y1 - 42),
                     ),
                     cv2.FONT_HERSHEY_SIMPLEX,
-                    0.6,
+                    0.55,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+                cv2.putText(
+                    vis,
+                    line3,
+                    (
+                        face.x1,
+                        max(0, face.y1 - 22),
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.55,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
+                cv2.putText(
+                    vis,
+                    line4,
+                    (
+                        face.x1,
+                        max(0, face.y1 - 4),
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
                     color,
-                    2,
+                    1,
+                    cv2.LINE_AA,
                 )
 
                 # -----------------------------------------------------
@@ -868,6 +1154,133 @@ def main() -> None:
                     )
 
             # ---------------------------------------------------------
+            # Lock overlay
+            # ---------------------------------------------------------
+
+            if lock_on and targets:
+                lock_lost_at = None
+
+                f0 = targets[0]
+
+                cv2.rectangle(
+                    vis,
+                    (f0.x1, f0.y1),
+                    (f0.x2, f0.y2),
+                    (255, 255, 0),
+                    4,
+                )
+
+                cv2.putText(
+                    vis,
+                    "LOCK",
+                    (f0.x2 + 6, f0.y1 + 22),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.6,
+                    (255, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
+                # Dim the faces that are not locked.
+                for f in faces:
+                    if f is f0:
+                        continue
+
+                    cv2.rectangle(
+                        vis,
+                        (f.x1, f.y1),
+                        (f.x2, f.y2),
+                        (128, 128, 128),
+                        1,
+                    )
+
+            elif lock_on:
+                if lock_lost_at is None:
+                    lock_lost_at = time.time()
+
+                lost = time.time() - lock_lost_at
+                lc = (
+                    (0, 200, 255)
+                    if lost < 3.0
+                    else (0, 0, 255)
+                )
+
+                cv2.rectangle(
+                    vis,
+                    (0, 0),
+                    (width - 1, height - 1),
+                    lc,
+                    5,
+                )
+
+                cv2.putText(
+                    vis,
+                    f"LOCK LOST {lost:.1f}s",
+                    (
+                        width // 2 - 140,
+                        height // 2,
+                    ),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    1.0,
+                    lc,
+                    3,
+                    cv2.LINE_AA,
+                )
+
+                if lost >= 3.0:
+                    lock_on = False
+                    locked_face = None
+                    locked_name = None
+                    lock_lost_at = None
+
+                    print(
+                        "[recognize] auto-unlocked: "
+                        "locked face lost"
+                    )
+
+            # ---------------------------------------------------------
+            # Missing-face warning
+            # ---------------------------------------------------------
+
+            now_ts = time.time()
+
+            if faces:
+                last_face_seen = now_ts
+
+            elif not lock_on:
+                missing_for = now_ts - last_face_seen
+
+                if missing_for > 1.0:
+                    # Orange first, red if it persists.
+                    color = (
+                        (0, 165, 255)
+                        if missing_for < 4.0
+                        else (0, 0, 255)
+                    )
+
+                    cv2.rectangle(
+                        vis,
+                        (0, 0),
+                        (width - 1, height - 1),
+                        color,
+                        8,
+                    )
+
+                    cv2.putText(
+                        vis,
+                        "NO FACE DETECTED",
+                        (
+                            width // 2 - 160,
+                            height // 2,
+                        ),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        1.2,
+                        color,
+                        3,
+                        cv2.LINE_AA,
+                    )
+
+            # ---------------------------------------------------------
             # Header
             # ---------------------------------------------------------
 
@@ -875,6 +1288,12 @@ def main() -> None:
                 f"IDs={len(matcher._names)} "
                 f"thr(dist)={matcher.dist_thresh:.2f}"
             )
+
+            if lock_on:
+                header += (
+                    f" | LOCK="
+                    f"{locked_name or '...'}"
+                )
 
             if fps is not None:
                 header += f" fps={fps:.1f}"
@@ -942,6 +1361,21 @@ def main() -> None:
                     "[recognize] "
                     f"thr(dist)={matcher.dist_thresh:.2f} "
                     f"(sim~{1.0 - matcher.dist_thresh:.2f})"
+                )
+
+            elif key == ord("l"):
+                lock_on = not lock_on
+                locked_face = None
+                locked_name = None
+                lock_lost_at = None
+
+                print(
+                    "[recognize] lock: "
+                    + (
+                        "ON (press l to stop)"
+                        if lock_on
+                        else "OFF (multi-face)"
+                    )
                 )
 
             elif key == ord("d"):
