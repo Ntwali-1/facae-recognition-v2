@@ -33,6 +33,7 @@ Notes:
 
 from __future__ import annotations
 
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -616,6 +617,12 @@ class FaceDBMatcher:
 
 
 def main() -> None:
+    camera_index = (
+        int(sys.argv[1])
+        if len(sys.argv) > 1
+        else 0
+    )
+
     db_path = Path(
         "data/db/face_db.npz"
     )
@@ -650,7 +657,7 @@ def main() -> None:
             dist_thresh=0.82,
         )
 
-        cap = cv2.VideoCapture(2)
+        cap = cv2.VideoCapture(camera_index)
 
         if not cap.isOpened():
             raise RuntimeError(

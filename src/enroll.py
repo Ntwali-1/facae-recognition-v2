@@ -40,6 +40,7 @@ Controls:
 from __future__ import annotations
 
 import json
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -319,7 +320,7 @@ def draw_status(
 
 
 def main(
-    camera_index: int = 2,
+    camera_index: int = 0,
 ) -> None:
     cfg = EnrollConfig()
 
@@ -798,4 +799,10 @@ def main(
 
 
 if __name__ == "__main__":
-    main()
+    camera_index = (
+        int(sys.argv[1])
+        if len(sys.argv) > 1
+        else 0
+    )
+
+    main(camera_index=camera_index)
